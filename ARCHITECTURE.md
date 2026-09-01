@@ -125,6 +125,9 @@ erDiagram
         REAL start_time "NOT NULL"
         REAL end_time "NOT NULL"
         TEXT manifest_key "NULL unless UPLOAD_EVENT_MANIFEST"
+        TEXT person "recognized sub_label; NULL for unnamed person"
+        INTEGER face_detected "1 when saved Frigate event metadata contains face attribute"
+        REAL recorded_at "first insertion time; Slack summary cursor field"
         REAL completed_at "set when all segments uploaded"
         TEXT last_error
         REAL updated_at "NOT NULL"

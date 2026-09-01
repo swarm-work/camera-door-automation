@@ -25,6 +25,8 @@ def clean_env(monkeypatch):
         "NOTION_VERSION", "CLIP_LINKS", "CLIP_URL_TTL_SECONDS", "CLIP_REFRESH_SECONDS",
         "CLIP_AWS_ACCESS_KEY_ID", "CLIP_AWS_SECRET_ACCESS_KEY",
         "SLACK_WEBHOOK_URL", "SLACK_SUMMARY_TIME", "SLACK_SUMMARY_ON_EMPTY",
+        "SLACK_INCLUDE_KNOWN", "SLACK_INCLUDE_SNAPSHOTS",
+        "SLACK_UNKNOWN_REQUIRES_FACE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -43,12 +45,17 @@ def test_defaults_are_safe(monkeypatch):
     assert (s.poll_seconds, s.settle_seconds) == (30.0, 5.0)
     assert s.notion_token is None and s.notion_database_id is None
     assert s.clip_links is False, "clip links must be opt-in"
+    assert s.slack_unknown_requires_face is False
 
 
 def test_manifest_upload_defaults_off(monkeypatch):
     """The manifest embeds sub_label — a real name. Deleting the env line, which
     .env.example's own header recommends for unwanted settings, must not enable it."""
     assert rec.Settings.from_env().upload_manifest is False
+
+def test_unknown_face_filter_is_opt_in(monkeypatch):
+    monkeypatch.setenv("SLACK_UNKNOWN_REQUIRES_FACE", "true")
+    assert rec.Settings.from_env().slack_unknown_requires_face is True
 
 
 def test_clip_ttl_is_clamped_to_the_sigv4_maximum(monkeypatch):

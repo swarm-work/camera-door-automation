@@ -32,6 +32,7 @@ Also record current values privately:
 - `NOTION_DATABASE_ID`
 - whether `CLIP_LINKS=true`
 - whether `NOTION_INCLUDE_PERSON=true`
+- whether `SLACK_UNKNOWN_REQUIRES_FACE=true`
 
 ## Phase 1 — Production S3 bucket
 
@@ -479,6 +480,7 @@ S3_BUCKET=<production-bucket>
 AWS_REGION=<production-bucket-region>
 NOTION_TOKEN=<production-token>
 NOTION_DATABASE_ID=<production-database-id>
+SLACK_UNKNOWN_REQUIRES_FACE=true
 
 # Keep legacy delivery active until the generated-clip proof below succeeds.
 CLIP_SOURCE=segments

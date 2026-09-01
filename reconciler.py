@@ -57,6 +57,7 @@ class Settings:
     slack_summary_on_empty: bool
     slack_include_known: bool
     slack_include_snapshots: bool
+    slack_unknown_requires_face: bool
 
     @staticmethod
     def from_env() -> "Settings":
@@ -125,6 +126,7 @@ class Settings:
             slack_summary_on_empty=b("SLACK_SUMMARY_ON_EMPTY", False),
             slack_include_known=b("SLACK_INCLUDE_KNOWN", False),
             slack_include_snapshots=b("SLACK_INCLUDE_SNAPSHOTS", False),
+            slack_unknown_requires_face=b("SLACK_UNKNOWN_REQUIRES_FACE", False),
         )
 
 
@@ -240,6 +242,8 @@ def open_state(path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE event_delivery ADD COLUMN person TEXT")
     if "recorded_at" not in table_columns(conn, "event_delivery"):
         conn.execute("ALTER TABLE event_delivery ADD COLUMN recorded_at REAL")
+    if "face_detected" not in table_columns(conn, "event_delivery"):
+        conn.execute("ALTER TABLE event_delivery ADD COLUMN face_detected INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -443,6 +447,20 @@ def recognized_person(event: dict[str, Any]) -> str | None:
     if isinstance(sub, str) and sub.strip():
         return sub.strip()
     return None
+
+def has_detected_face(event: dict[str, Any]) -> bool:
+    """Whether Frigate's saved event snapshot contains a detected face attribute."""
+    data = parse_json(event.get("data"))
+    if not isinstance(data, dict):
+        return False
+    attributes = data.get("attributes")
+    if not isinstance(attributes, list):
+        return False
+    return any(
+        isinstance(attribute, dict)
+        and str(attribute.get("label", "")).casefold() == "face"
+        for attribute in attributes
+    )
 
 
 def notion_properties(event: dict[str, Any], manifest_key: str | None, segments: int, settings: Settings) -> dict[str, Any]:
@@ -877,14 +895,17 @@ def slack_snapshot_urls(rows: list[sqlite3.Row], settings: Settings, client=None
 
 
 
-def unknown_events_between(state: sqlite3.Connection, since: float, until: float, by_field: str = "recorded_at") -> list[sqlite3.Row]:
+def unknown_events_between(state: sqlite3.Connection, since: float, until: float,
+                           by_field: str = "recorded_at",
+                           require_face: bool = False) -> list[sqlite3.Row]:
     # When querying historical dates, filter by start_time (when the event happened).
     # In the automated loop, filter by recorded_at (when the event entered the state DB).
     time_col = "start_time" if by_field == "start_time" else "recorded_at"
+    face_clause = " AND e.face_detected = 1" if require_face else ""
     return state.execute(f"""
         SELECT e.event_id, e.camera, e.start_time, e.end_time, e.completed_at, n.page_id
           FROM event_delivery e LEFT JOIN notion_delivery n ON n.event_id = e.event_id
-         WHERE e.{time_col} >= ? AND e.{time_col} <= ? AND e.person IS NULL
+         WHERE e.{time_col} >= ? AND e.{time_col} <= ? AND e.person IS NULL{face_clause}
          ORDER BY e.start_time ASC""", (since, until)).fetchall()
 
 
@@ -899,13 +920,22 @@ def known_events_between(state: sqlite3.Connection, since: float, until: float, 
          ORDER BY e.person ASC""", (since, until)).fetchall()
 
 
-def refresh_people_from_source(state: sqlite3.Connection, settings: Settings, since: float, until: float) -> None:
-    """Backfill person labels for historical summaries from the source Fregata DB.
+def refresh_people_from_source(state: sqlite3.Connection, settings: Settings,
+                               since: float, until: float,
+                               by_field: str = "start_time") -> None:
+    """Refresh identity and face-presence metadata for a Slack summary window.
 
-    Rows created before the Slack summary feature have event_delivery.person=NULL
-    forever unless we re-read Fregata. A date-specific "unknown visitors" summary
-    must use the event's actual face-recognition result, not stale state shape.
+    Old state rows may predate either column, and completed events are otherwise
+    skipped before process_event can refresh them. Resolve the exact state event
+    ids in the requested window, then re-read their final Frigate classification.
     """
+    time_col = "start_time" if by_field == "start_time" else "recorded_at"
+    event_ids = [str(row["event_id"]) for row in state.execute(
+        f"SELECT event_id FROM event_delivery WHERE {time_col} >= ? AND {time_col} <= ?",
+        (since, until))]
+    if not event_ids:
+        return
+
     tmp: Path | None = None
     fconn: sqlite3.Connection | None = None
     try:
@@ -915,24 +945,37 @@ def refresh_people_from_source(state: sqlite3.Connection, settings: Settings, si
         table, cols = resolve_table(fconn, ("event", "events"), EVENT_REQUIRED)
         if "sub_label" not in cols:
             return
-        where = ["start_time >= ?", "start_time <= ?", "label = ?"]
-        params: list[Any] = [since, until, settings.label]
-        if settings.camera:
-            where.append("camera = ?")
-            params.append(settings.camera)
+        select_cols = ["id", "sub_label"]
+        if "data" in cols:
+            select_cols.append("data")
         updates = []
-        for row in fconn.execute(
-                f"SELECT id, sub_label FROM {qident(table)} WHERE {' AND '.join(where)}",
-                params):
-            person = recognized_person({"sub_label": parse_json(row["sub_label"])})
-            updates.append((person, time.time(), str(row["id"])))
+        for offset in range(0, len(event_ids), 500):
+            batch = event_ids[offset:offset + 500]
+            where = [f"id IN ({','.join('?' for _ in batch)})", "label = ?"]
+            params: list[Any] = [*batch, settings.label]
+            if settings.camera:
+                where.append("camera = ?")
+                params.append(settings.camera)
+            for row in fconn.execute(
+                    f"SELECT {', '.join(qident(c) for c in select_cols)} "
+                    f"FROM {qident(table)} WHERE {' AND '.join(where)}",
+                    params):
+                event = {"sub_label": parse_json(row["sub_label"])}
+                if "data" in cols:
+                    event["data"] = parse_json(row["data"])
+                updates.append((
+                    recognized_person(event),
+                    int(has_detected_face(event)),
+                    time.time(),
+                    str(row["id"]),
+                ))
         if updates:
             state.executemany(
-                "UPDATE event_delivery SET person=?, updated_at=? WHERE event_id=?",
+                "UPDATE event_delivery SET person=?, face_detected=?, updated_at=? WHERE event_id=?",
                 updates)
             state.commit()
     except Exception as exc:
-        LOG.warning("Could not refresh Slack summary people from Fregata source DB: %s", exc)
+        LOG.warning("Could not refresh Slack summary classification from Fregata source DB: %s", exc)
     finally:
         if fconn is not None:
             fconn.close()
@@ -1116,7 +1159,12 @@ def maybe_send_slack_summary(state: sqlite3.Connection, settings: Settings, now:
         scheduled = summary_scheduled_epoch(now, settings)
         if now < scheduled or float(last) >= scheduled:
             return
-        rows = unknown_events_between(state, float(last), now)
+        if settings.slack_unknown_requires_face:
+            refresh_people_from_source(
+                state, settings, float(last), now, by_field="recorded_at")
+        rows = unknown_events_between(
+            state, float(last), now,
+            require_face=settings.slack_unknown_requires_face)
         known = known_events_between(state, float(last), now) if settings.slack_include_known else []
         if not rows and not known and not settings.slack_summary_on_empty:
             set_meta(state, SLACK_SENT_AT_KEY, str(now))
@@ -1175,10 +1223,13 @@ def slack_summary_now(settings: Settings, target_date: str | None = None) -> int
             by_field = "recorded_at"
             is_historical = False
 
-        if is_historical:
-            refresh_people_from_source(state, settings, since, until)
+        if is_historical or settings.slack_unknown_requires_face:
+            refresh_people_from_source(
+                state, settings, since, until, by_field=by_field)
 
-        rows = unknown_events_between(state, since, until, by_field=by_field)
+        rows = unknown_events_between(
+            state, since, until, by_field=by_field,
+            require_face=settings.slack_unknown_requires_face)
         known = known_events_between(state, since, until, by_field=by_field) if settings.slack_include_known else []
         if settings.dry_run:
             text = render_slack_summary(rows, header_ts, known_rows=known or None)
@@ -1239,11 +1290,11 @@ def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_ta
     now = time.time()
     # recorded_at is deliberately NOT in the conflict clause: it marks when this event first
     # entered the state DB, which is what scopes it into exactly one Slack summary window.
-    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,recorded_at,updated_at)
-                     VALUES(?,?,?,?,?,?,?)
-                     ON CONFLICT(event_id) DO UPDATE SET person=excluded.person,updated_at=excluded.updated_at,last_error=NULL""",
+    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,face_detected,recorded_at,updated_at)
+                     VALUES(?,?,?,?,?,?,?,?)
+                     ON CONFLICT(event_id) DO UPDATE SET person=excluded.person,face_detected=excluded.face_detected,updated_at=excluded.updated_at,last_error=NULL""",
                   (event_id, event["camera"], event["start_time"], event["end_time"],
-                   recognized_person(event), now, now))
+                   recognized_person(event), int(has_detected_face(event)), now, now))
     state.commit()
     if not segments:
         raise RuntimeError(f"No recording segments overlap event {event_id} window {utc_iso(start)} to {utc_iso(end)}")

@@ -110,9 +110,9 @@ rotated), run `python3 reconciler.py clips-reset` to re-sign everything.
 ## Slack end-of-day summary (optional)
 
 With `SLACK_WEBHOOK_URL` set, the watch loop posts **one message per day** at
-`SLACK_SUMMARY_TIME` (local, default 21:00) listing every event since the previous
-summary that face recognition matched to nobody. There are no per-event pings — the
-door camera should not own your notifications — and quiet days post nothing unless
+`SLACK_SUMMARY_TIME` (local, default 21:00) listing unnamed person events since
+the previous summary. There are no per-event pings — the door camera should not
+own your notifications — and quiet days post nothing unless
 `SLACK_SUMMARY_ON_EMPTY=true`.
 
 Design choices worth knowing:
@@ -126,6 +126,12 @@ Design choices worth knowing:
 - **Recognized visitors opt-in.** Familiar (household) people can be included
   in the summary by setting `SLACK_INCLUDE_KNOWN=true`. Recognized names and
   visit counts are listed cleanly without attaching video links.
+- **Back-facing exits can be filtered.** Set
+  `SLACK_UNKNOWN_REQUIRES_FACE=true` to include an unnamed person only when
+  Frigate's saved event metadata contains a detected `face` attribute. This
+  suppresses typical back-of-head exits but can omit a real unknown entrant
+  whose face was never visible. It changes Slack only; footage still reaches
+  S3 and Notion.
 - **No presigned clip URLs in Slack.** Video links remain out of Slack; each
   event card links to its Notion page instead, which is access-controlled and
   where the clip already lives.
