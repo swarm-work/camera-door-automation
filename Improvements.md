@@ -119,20 +119,21 @@ Definitions:
 
 Recommended eventual target: `verified_face`, with unknown real faces retained and non-face person detections ignored. Do not use `sub_label IS NOT NULL` as a substitute, because that would exclude unknown visitors.
 
-## 2. Two-hour event digests and daily summary
+## 2. Configurable interval digests and daily summary
 
 ### Message contracts
 
 Use distinct messages and independent cursors.
 
-#### Two-hour digest
+#### Interval digest
 
-Purpose: operational visibility during the day.
+Purpose: operational visibility during the day. The initial cadence is two hours,
+but it must be configuration rather than a hard-coded schedule.
 
-- Contains only new eligible events since the previous successful two-hour post.
+- Contains only new eligible events since the previous successful interval post.
 - Uses the future face filter; until then it uses the current unknown-person event set.
 - Does not include recognized household names in the default message.
-- Does not send an empty message every two hours unless a health warning exists.
+- Does not send an empty message each interval unless a health warning exists.
 - On failure, does not advance its cursor; retry on the next watch pass.
 - If the Mac sleeps through a boundary, send one catch-up digest on wake covering the complete gap.
 
@@ -149,10 +150,10 @@ A separate key is required; the existing daily summary cursor must not be reused
 Purpose: complete daily rollup rather than an alert feed.
 
 - Covers one complete local calendar day.
-- Repeats events already seen in two-hour digests intentionally, but labels the message as a daily rollup.
+- Repeats events already seen in interval digests intentionally, but labels the message as a daily rollup.
 - Includes health/proof-of-life data so zero events is distinguishable from an outage.
 - Keeps the simple `People in Hackerhouse` numbered-name report separate from unknown-event reporting.
-- Uses a daily date marker, not the two-hour cursor.
+- Uses a daily date marker, not the interval cursor.
 
 Recommended schedule: run at `00:05` and summarize the previous local calendar day. A report sent at `21:00` is not a whole-day report because events between 21:00 and midnight are absent. The five-minute delay also lets final Frigate events settle.
 
@@ -168,10 +169,15 @@ Reuse the existing daily settings rather than creating a second naming conventio
 
 ```env
 SLACK_INTERVAL_ENABLED=false
-SLACK_INTERVAL_MINUTES=120
+SLACK_INTERVAL_HOURS=2
 SLACK_SUMMARY_TIME=00:05
 SLACK_SUMMARY_ON_EMPTY=true
 ```
+
+Changing the interval should require only an environment update and service
+restart, for example `SLACK_INTERVAL_HOURS=5`. Validate it as a positive number.
+The scheduler must measure from its last successful cursor rather than assume
+the value divides evenly into 24 hours.
 
 All new outbound-message flags must default to false until explicitly enabled.
 
@@ -194,6 +200,7 @@ Manual historical commands must not advance automated cursors.
 - Advance a cursor only after Slack returns success.
 - Initialize a new interval cursor at enable time; do not dump all historical events.
 - Use separate idempotency state for interval and daily messages.
+- Changing `SLACK_INTERVAL_HOURS` preserves the existing cursor and starts the new cadence from the last successful post.
 - Cap Slack Block Kit rows and link to the production Notion database for overflow.
 - Do not run two schedulers that can post the same cursor concurrently.
 
@@ -207,14 +214,15 @@ Do not add cron for the primary Mac deployment. Keep the existing launchd servic
 launchd/com.swarm.entry-logger.plist
   -> python3 reconciler.py watch
 ```
-
 The `watch` loop already polls continuously and currently checks whether the daily Slack summary is due. Extend that same process to check both schedules:
 
 ```text
 every poll:
   reconcile Frigate events to S3/Notion
-  check whether two-hour digest is due
-  check whether previous-day summary is due
+  if last successful interval post is at least SLACK_INTERVAL_HOURS old:
+    send one gap-free interval digest
+  if the previous local day has not received its EOD report:
+    send the complete previous-day summary
   record heartbeat/health state
   sleep POLL_SECONDS
 ```
@@ -243,10 +251,14 @@ In launchd, use absolute paths; it does not activate a shell virtual environment
 watch
 ```
 
+This single launchd-managed process is the required continuously running EOD
+automation. Do not create a second EOD daemon: separate processes can race over
+the same SQLite state and post duplicates.
+
 ### Why not cron
 
 - Cron jobs can be missed while the Mac is asleep.
-- Separate two-hour and daily processes can race over the same state DB/cursor.
+- Separate interval and daily processes can race over the same state DB/cursor.
 - Cron has a minimal environment and frequently misses `.env`, PATH, or virtualenv assumptions.
 - The existing long-running launchd service already provides restart and catch-up behavior.
 
@@ -261,7 +273,67 @@ If the reconciler eventually moves to Linux and no watch service is used, equiva
 
 These are illustrative future commands only. The commands and process-level locking must exist before installing these entries. On Linux, a systemd service/timer is preferable to cron for logging, retries, dependency ordering, and missed-run handling.
 
-## 4. Prevent sound from retaining motion clips
+## 4. Slack thumbnail durability
+
+### Why old thumbnails disappear
+
+The current Slack card does not upload the snapshot into Slack. It uploads the
+image to S3 and places a presigned `image_url` in the Block Kit message. Slack
+requires `image_url` to be publicly reachable when it fetches or re-fetches the
+message image. See Slack's [image element reference](https://docs.slack.dev/reference/block-kit/block-elements/image-element/).
+
+The reconciler signs snapshot URLs with `CLIP_URL_TTL_SECONDS`. AWS SigV4 permits
+at most seven days, and temporary SSO/STS credentials shorten that further: the
+URL stops working when the signing session expires. Slack can then no longer
+retrieve the image even though the snapshot object still exists in S3. This is
+expected with the current design and explains why previously visible thumbnails
+later become blank.
+
+### Product decision required
+
+Choose one explicit retention contract:
+
+1. **Expiring thumbnail, recommended privacy default.** Keep the current
+   presigned URL design, state in the message/docs that thumbnails are temporary,
+   and use the Notion link for later viewing.
+2. **Durable Slack-hosted image.** Add a Slack bot token and upload snapshots with
+   Slack's file API, then reference a `slack_file` ID in Block Kit. This persists
+   according to Slack workspace retention, but creates a second biometric-image
+   store and requires `files:write`, file deletion, and retention controls.
+3. **Refresh old Slack messages.** Store channel/message timestamps and use
+   `chat.update` to replace expired URLs before they lapse. Incoming webhooks are
+   insufficient; this needs a bot token, message ownership, retry state, and a
+   permanent scheduler.
+
+Never make the S3 snapshot prefix public merely to keep Slack thumbnails alive.
+
+### Proposed configuration
+
+```env
+SLACK_SNAPSHOT_MODE=expiring_url
+SLACK_SNAPSHOT_URL_TTL_SECONDS=604800
+# Future durable mode:
+# SLACK_SNAPSHOT_MODE=slack_file
+```
+
+Give snapshots their own TTL setting rather than implicitly sharing the Notion
+clip TTL. Clamp presigned URLs to the AWS seven-day maximum and report when
+temporary credentials reduce the real lifetime.
+
+### Implementation tasks
+
+- Decide whether historical Slack thumbnails are intentionally temporary.
+- Add the separate snapshot TTL and startup validation.
+- Include an expiry note in messages when using presigned URLs.
+- If durable mode is approved, add Slack bot authentication and file uploads;
+  do not reuse the incoming webhook as though it can upload binary files.
+- Store Slack file IDs and message timestamps needed for deletion/audit.
+- Add a Slack-file retention cleanup that matches company policy.
+- Keep S3 snapshot lifecycle longer than the promised URL lifetime plus a small
+  retry buffer.
+- Test that expired URLs fail without affecting the text summary or Notion link.
+
+## 5. Prevent sound from retaining motion clips
 
 Frigate's [audio detector documentation](https://docs.frigate.video/configuration/audio_detectors/) states that audio volume above `min_volume` is considered motion for recording retention. Audio events also save a snapshot and recordings for the duration of the event.
 
@@ -392,7 +464,7 @@ LIMIT 20;
 "
 ```
 
-## 5. S3 clip archiving and deletion
+## 6. S3 clip archiving and deletion
 
 ### Use S3 Lifecycle, not a cleanup cron
 
@@ -470,29 +542,33 @@ Deleting local Frigate recordings after successful S3 upload is a different cont
 
 Do not enable local deletion during the S3 or Notion production migration.
 
-## 6. Recommended implementation order
+## 7. Recommended implementation order
 
 1. Disable audio-triggered motion retention and verify it with a controlled test.
 2. Add reconciler heartbeat and Frigate recording-freshness health reporting.
 3. Define and implement the durable face-evidence signal.
-4. Add separate two-hour and daily summary cursors.
-5. Schedule both inside the existing `watch` process.
-6. Migrate S3 and Notion following `migration.md`.
-7. Add lifecycle-aware Notion clip behavior.
-8. Enable S3 Lifecycle rules.
-9. Observe production for several days.
-10. Only then consider local recording deletion.
+4. Choose the Slack thumbnail retention contract.
+5. Add separate configurable-interval and daily summary cursors.
+6. Schedule both inside the existing `watch` process.
+7. Migrate S3 and Notion following `migration.md`.
+8. Add lifecycle-aware Notion clip behavior.
+9. Enable S3 Lifecycle rules.
+10. Observe production for several days.
+11. Only then consider local recording deletion.
 
 ## Acceptance criteria
 
 - A sound-only test produces no new audio Review item and no sound-retained motion clip.
 - A real unknown face can still reach the unknown-event pipeline.
 - A person detection with no verified face is excluded when the future face-only mode is enabled.
-- Every eligible event appears in exactly one two-hour delta window.
+- Every eligible event appears in exactly one interval delta window.
+- Changing the interval from two to five hours requires configuration only and does not lose or duplicate events.
 - A failed Slack post is retried without losing the window.
 - The daily report covers a complete local calendar day.
+- One launchd-managed `watch` process reliably handles both interval and EOD schedules.
 - A sleeping/restarted Mac catches up without duplicate posts.
 - A zero-event daily report states whether Frigate and camera recordings were healthy.
+- Thumbnail behavior matches its documented expiry or Slack-file retention contract.
 - S3 archive and deletion behavior matches the approved retention table.
 - Expired recordings no longer leave misleading live links in Notion.
 - No local source file is deleted until its production S3 object is verified and the safety window has passed.
