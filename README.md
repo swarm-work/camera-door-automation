@@ -61,6 +61,7 @@ The reconciler takes one of the following commands:
 - `watch`: Runs `once` in an infinite loop, sleeping for `POLL_SECONDS` between passes.
 - `status`: Outputs the current delivery status, including completed/failed events and uploaded segments.
 - `slack-summary`: Posts the Slack unknown-visitor summary immediately, ignoring the schedule (with `DRY_RUN=true` it prints the message instead of posting).
+- `event-clips-backfill`: Dry-run or generate missing single entry-focused MP4s for a historical date.
 
 Example:
 
@@ -68,27 +69,74 @@ Example:
 python3 reconciler.py watch
 ```
 
+## Approved face-library backup and migration
+
+`face_gallery.py` backs up only reviewed images inside visible person directories
+under Frigate's `clips/faces` library. It excludes `train`, hidden entries,
+symlinks, unsupported files, and loose files outside a person directory. Raw
+approved images are the canonical migration data; face-model embeddings are
+rebuildable. `FACE_GALLERY_BFR_DB` can add a consistent `bfr.db` snapshot for
+convenience, but it does not replace the raw images.
+
+Build locally and print the deterministic export ID without contacting S3:
+
+```bash
+python3 face_gallery.py export
+```
+
+Publish the archive and versioned manifest, verify their SHA-256 hashes through
+S3 `head` and `get` operations, then publish `COMPLETE` last:
+
+```bash
+python3 face_gallery.py export --apply
+python3 face_gallery.py verify EXPORT_ID
+```
+
+Restore always verifies the completed remote export first. Without `--apply` it
+is a no-write preview; with `--apply` it extracts only into the requested empty
+staging directory:
+
+```bash
+python3 face_gallery.py restore EXPORT_ID --output ~/face-gallery-staging
+python3 face_gallery.py restore EXPORT_ID --output ~/face-gallery-staging --apply
+```
+
+Restore rejects traversal paths, symlink members, populated output directories,
+and any output that overlaps the configured live face library. It never writes
+to Frigate directly: inspect the staging directory, then import it separately.
+
+Treat the destination as a private biometric-data backup. S3 object keys are
+content-addressed and contain no person names, and routine logs report only IDs
+and counts; names remain inside the encrypted archive and manifest. Every object
+uses SSE-S3 (`AES256`) by default. Set `FACE_GALLERY_KMS_KEY_ID` to require
+SSE-KMS instead. See `.env.example` for bucket/profile/source configuration and
+the optional database snapshot.
+
 ## Clip links in Notion (optional)
 
 With `CLIP_LINKS=true`, every Notion page gets a working video link in its **Clip**
 property (create it in the database first, type **URL** — `python3 test-notion.py`
-verifies it). The link opens a viewer page hosted in the S3 bucket, one player per
-recording segment. No server runs anywhere: the reconciler presigns the page and its
-videos, and the same poll loop that uploads footage re-signs any link older than
-`CLIP_REFRESH_SECONDS` (signatures die at `CLIP_URL_TTL_SECONDS`; 7 days is the
-SigV4 maximum). Pages synced before the feature existed pick their links up
-automatically on the next pass.
+verifies it). `CLIP_SOURCE=segments` preserves the legacy viewer page with one
+player per raw Frigate recording segment. `CLIP_SOURCE=frigate_api` instead asks
+the local Frigate API for one short MP4 centered on the person event's start and
+links that object directly. This avoids showing sound/motion-retained boundary
+segments where the person is absent. It does not remove an audio track that is
+inside the event clip.
+
+The poll loop re-signs links older than `CLIP_REFRESH_SECONDS`; signatures die at
+`CLIP_URL_TTL_SECONDS` and SigV4 caps them at seven days. Existing legacy pages
+remain usable while single-event clips are backfilled.
 
 Know what you are enabling:
 
 - **The link is a bearer token.** Anyone who can see the Notion page — including via
   a share link or a forwarded URL — can watch that event until the signature expires.
   Keep the database's publish-to-web off. Notion's page history also retains
-  superseded links until they expire on their own. And because each refresh rewrites
-  the viewer page in place with fresh video URLs, someone who captured a page link
-  and re-fetches it near its expiry can reach the videos for up to
-  `CLIP_URL_TTL_SECONDS + CLIP_REFRESH_SECONDS` after the capture (~12 days on
-  defaults) — shrink both settings if that bound matters to you.
+  superseded links until they expire on their own. In legacy `segments` mode,
+  each refresh rewrites the viewer page in place with fresh video URLs, so someone
+  who captured a page link and re-fetches it near expiry can reach the videos for
+  up to `CLIP_URL_TTL_SECONDS + CLIP_REFRESH_SECONDS` after capture. Generated
+  direct-MP4 links do not have that extra viewer-page renewal behavior.
 - **Re-signing does not revoke.** Old URLs stay valid to their own expiry. The kill
   switch is deactivating the signing key — set `CLIP_AWS_ACCESS_KEY_ID`/`_SECRET` to
   a dedicated read-only IAM user so that gesture doesn't stop uploads too.
@@ -103,9 +151,36 @@ Know what you are enabling:
   `PutObject`.
 - If an S3 lifecycle rule expires old segments, the pages for those events keep
   rendering but their videos 404. The link makes existing retention visible.
+- **No silent source fallback.** Once `CLIP_SOURCE=frigate_api` is enabled, an
+  API failure is recorded and retried; it never quietly returns to multi-segment
+  HTML while claiming success.
 
 After fixing a broken setup (Clip property was missing, or the signing key was
 rotated), run `python3 reconciler.py clips-reset` to re-sign everything.
+
+Prove the configured local API first, then enable new single-event clips:
+
+```bash
+curl -fL \
+  \"http://127.0.0.1:5000/api/door_camera/start/START/end/END/clip.mp4\" \
+  -o /tmp/frigate-event-test.mp4
+
+# after inspecting the MP4:
+# CLIP_SOURCE=frigate_api
+python3 reconciler.py once
+```
+
+Historical backfill is safe by default and requires `--apply` to write:
+
+```bash
+python3 reconciler.py event-clips-backfill --date 2026-08-29 --dry-run
+python3 reconciler.py event-clips-backfill --date 2026-08-29 --apply
+```
+
+Each success stores
+`fregata/events/<camera>/<event_id>/clip.mp4`, verifies its S3 length, and marks
+that Notion link stale for the normal refresh pass. A missing historical Frigate
+recording keeps its legacy HTML link.
 
 ## Slack end-of-day summary (optional)
 

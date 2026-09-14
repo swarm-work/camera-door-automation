@@ -1,6 +1,6 @@
 # Migration Plan
 
-This is a reminder plan only. Do not treat it as an implementation checklist that is already coded.
+This is a rollout plan. Sections explicitly marked implemented exist behind safe defaults; no production switch should be inferred from code availability.
 
 Goal: move the door-camera automation off personal infrastructure and onto production S3 + production Notion without duplicating pages, losing clips, or deleting local recordings too early.
 
@@ -12,7 +12,7 @@ Goal: move the door-camera automation off personal infrastructure and onto produ
 - Current state tracks uploaded S3 keys and Notion page ids, but it does not yet fully model multiple S3/Notion targets as separate destinations.
 - Existing Notion `page_id` values point to the currently configured Notion database. Switching `NOTION_DATABASE_ID` alone can make old events look already synced and skip creating production pages.
 - Existing Notion clip links may point to the old bucket until `clips-reset` and a refresh pass regenerate them.
-- Current event HTML lists raw recording segments; planned Frigate API delivery will replace this with one generated MP4 for new/backfilled events.
+- Event-focused Frigate API delivery is implemented behind `CLIP_SOURCE=frigate_api`; the safe default remains `segments`, and production backfill is pending.
 - Frigate owns the local recording files. Do not add direct reconciler deletion until production migration and the single-clip architecture are complete; prefer Frigate retention.
 
 ## Phase 0 — Backups before touching production
@@ -175,11 +175,12 @@ Use this direct endpoint for automation instead of the asynchronous export API.
 It avoids export-job polling and produces the single media object needed by
 Notion.
 
-Important non-goal: the API returns one video for the requested time range. It
-does not trim away every frame where the person is absent. Existing
-`PRE_ROLL_SECONDS` and `POST_ROLL_SECONDS` still control surrounding context.
+The generated MP4 uses a short entry-focused window rather than the entire
+tracked stay: it begins `EVENT_CLIP_PRE_ROLL_SECONDS` before
+`event.start_time` and ends `EVENT_CLIP_DURATION_SECONDS` after that start.
+This centers the clip on entry but cannot guarantee every frame contains a face.
 
-### Manual API proof before implementation
+### Manual API proof and rollout gate
 
 Choose a known event whose existing HTML has multiple videos:
 
@@ -229,8 +230,8 @@ Proof acceptance:
 
 ```text
 person event
-  -> compute padded start/end
-  -> download one MP4 from Frigate recording-clip API
+  -> compute short window around event.start_time
+  -> stream one MP4 from Frigate recording-clip API
   -> upload one production S3 object
   -> store generated-clip delivery state
   -> put one presigned video link in production Notion
@@ -247,12 +248,14 @@ It is not a second permanent local recording.
 
 ### Configuration and rollout flag
 
-Add:
+Implemented configuration:
 
 ```env
 CLIP_SOURCE=segments
 FRIGATE_API_URL=http://127.0.0.1:5000/api
 FRIGATE_API_TIMEOUT_SECONDS=120
+EVENT_CLIP_PRE_ROLL_SECONDS=3
+EVENT_CLIP_DURATION_SECONDS=15
 ```
 
 Supported sources:
@@ -262,9 +265,10 @@ segments     current raw-segment + multi-video HTML behavior
 frigate_api  one generated event MP4
 ```
 
-Ship with `CLIP_SOURCE=segments`. Switch the Mac mini to
-`CLIP_SOURCE=frigate_api` only after the manual API proof and automated tests
-pass.
+Ship with `CLIP_SOURCE=segments`. The Mac mini's Fregata `0.17.2.3` endpoint
+returned HTTP 200 and a non-empty `video/mp4` for an 18-second entry window.
+Switch to `CLIP_SOURCE=frigate_api` only after inspecting one generated
+production object and confirming the entry framing is correct.
 
 Do not silently fall back to raw segments on an API error during initial
 rollout. A silent fallback would reintroduce multi-video pages while appearing

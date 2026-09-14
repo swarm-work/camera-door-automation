@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
 
 import boto3
 import requests
@@ -51,6 +52,11 @@ class Settings:
     clip_refresh_seconds: int
     clip_aws_access_key_id: str | None
     clip_aws_secret_access_key: str | None
+    clip_source: str
+    frigate_api_url: str
+    frigate_api_timeout: float
+    event_clip_pre_roll: float
+    event_clip_duration: float
     slack_webhook_url: str | None
     slack_summary_hour: int
     slack_summary_minute: int
@@ -82,6 +88,26 @@ class Settings:
                 "CLIP_AWS_ACCESS_KEY_ID and CLIP_AWS_SECRET_ACCESS_KEY must be set together: "
                 "with only one, clip links would silently be signed by the main upload "
                 "credentials and deactivating the dedicated key would revoke nothing")
+        clip_source = os.getenv("CLIP_SOURCE", "segments").strip().lower()
+        if clip_source not in {"segments", "frigate_api"}:
+            raise ValueError(
+                f"CLIP_SOURCE must be 'segments' or 'frigate_api', got {clip_source!r}")
+        frigate_api_url = os.getenv(
+            "FRIGATE_API_URL", "http://127.0.0.1:5000/api").strip().rstrip("/")
+        if clip_source == "frigate_api" and not frigate_api_url.startswith(
+                ("http://", "https://")):
+            raise ValueError(
+                "FRIGATE_API_URL must be an absolute http(s) URL "
+                "when CLIP_SOURCE=frigate_api")
+        frigate_api_timeout = float(os.getenv("FRIGATE_API_TIMEOUT_SECONDS", "120"))
+        event_clip_pre_roll = float(os.getenv("EVENT_CLIP_PRE_ROLL_SECONDS", "3"))
+        event_clip_duration = float(os.getenv("EVENT_CLIP_DURATION_SECONDS", "15"))
+        if frigate_api_timeout <= 0:
+            raise ValueError("FRIGATE_API_TIMEOUT_SECONDS must be greater than zero")
+        if event_clip_pre_roll < 0:
+            raise ValueError("EVENT_CLIP_PRE_ROLL_SECONDS must be zero or greater")
+        if event_clip_duration <= 0:
+            raise ValueError("EVENT_CLIP_DURATION_SECONDS must be greater than zero")
         summary_time = os.getenv("SLACK_SUMMARY_TIME", "21:00").strip()
         try:
             hour_str, minute_str = summary_time.split(":")
@@ -120,6 +146,11 @@ class Settings:
             clip_refresh_seconds=clip_refresh_seconds,
             clip_aws_access_key_id=clip_key_id,
             clip_aws_secret_access_key=clip_secret,
+            clip_source=clip_source,
+            frigate_api_url=frigate_api_url,
+            frigate_api_timeout=frigate_api_timeout,
+            event_clip_pre_roll=event_clip_pre_roll,
+            event_clip_duration=event_clip_duration,
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", "").strip() or None,
             slack_summary_hour=slack_hour,
             slack_summary_minute=slack_minute,
@@ -210,6 +241,24 @@ def open_state(path: Path) -> sqlite3.Connection:
         etag TEXT,
         uploaded_at REAL,
         PRIMARY KEY(event_id, source_path)
+      );
+      CREATE TABLE IF NOT EXISTS event_clip_delivery (
+        event_id TEXT NOT NULL,
+        bucket TEXT NOT NULL,
+        endpoint_url TEXT NOT NULL DEFAULT '',
+        region TEXT NOT NULL,
+        source TEXT NOT NULL,
+        camera TEXT NOT NULL,
+        start_time REAL NOT NULL,
+        end_time REAL NOT NULL,
+        s3_key TEXT,
+        etag TEXT,
+        size_bytes INTEGER,
+        generated_at REAL,
+        uploaded_at REAL,
+        last_error TEXT,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY(event_id, bucket, endpoint_url)
       );
       CREATE TABLE IF NOT EXISTS notion_delivery (
         event_id TEXT PRIMARY KEY,
@@ -370,6 +419,128 @@ def upload_manifest(client, settings: Settings, key: str, manifest: dict[str, An
         LOG.info("DRY RUN upload manifest -> s3://%s/%s\n%s", settings.bucket, key, body.decode())
         return
     client.put_object(Bucket=settings.bucket, Key=key, Body=body, ContentType="application/json")
+
+def event_clip_key(settings: Settings, camera: str, event_id: str) -> str:
+    rel = f"events/{camera}/{event_id}/clip.mp4"
+    return f"{settings.prefix}/{rel}" if settings.prefix else rel
+
+
+def event_clip_window(event: dict[str, Any], settings: Settings) -> tuple[float, float]:
+    """A short entry-focused window, rather than the person's entire tracked stay."""
+    event_start = float(event["start_time"])
+    event_end = float(event["end_time"])
+    start = event_start - settings.event_clip_pre_roll
+    end = min(event_start + settings.event_clip_duration,
+              event_end + settings.post_roll)
+    return start, max(end, event_start + 0.001)
+
+
+def frigate_event_clip_url(settings: Settings, camera: str,
+                           start: float, end: float) -> str:
+    camera_path = quote(camera, safe="")
+    return (f"{settings.frigate_api_url}/{camera_path}/start/{start:.6f}"
+            f"/end/{end:.6f}/clip.mp4")
+
+
+def deliver_event_clip(event: dict[str, Any], state: sqlite3.Connection,
+                       client, settings: Settings) -> dict[str, Any]:
+    """Stream one entry-focused Frigate MP4 to the current S3 destination."""
+    event_id = str(event["id"])
+    camera = str(event["camera"])
+    endpoint = settings.endpoint_url or ""
+    start, end = event_clip_window(event, settings)
+    key = event_clip_key(settings, camera, event_id)
+    existing = state.execute("""
+        SELECT s3_key,etag,size_bytes,generated_at,uploaded_at
+          FROM event_clip_delivery
+         WHERE event_id=? AND bucket=? AND endpoint_url=?""",
+        (event_id, settings.bucket, endpoint)).fetchone()
+    if existing and existing["uploaded_at"] is not None:
+        return {
+            "source": "frigate_api", "s3_key": str(existing["s3_key"]),
+            "etag": existing["etag"], "size_bytes": existing["size_bytes"],
+            "start_time": start, "end_time": end,
+        }
+    if settings.dry_run:
+        LOG.info("DRY RUN generate entry clip for event %s -> s3://%s/%s",
+                 event_id, settings.bucket, key)
+        return {
+            "source": "frigate_api", "s3_key": key, "etag": None,
+            "size_bytes": None, "start_time": start, "end_time": end,
+        }
+    if not settings.bucket:
+        raise RuntimeError("S3_BUCKET is required when DRY_RUN=false")
+
+    now = time.time()
+    state.execute("""
+        INSERT INTO event_clip_delivery(
+          event_id,bucket,endpoint_url,region,source,camera,start_time,end_time,
+          s3_key,last_error,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(event_id,bucket,endpoint_url) DO UPDATE SET
+          region=excluded.region,source=excluded.source,camera=excluded.camera,
+          start_time=excluded.start_time,end_time=excluded.end_time,
+          s3_key=excluded.s3_key,last_error=excluded.last_error,
+          updated_at=excluded.updated_at""",
+        (event_id, settings.bucket, endpoint, settings.region, "frigate_api",
+         camera, start, end, key, "entry clip generation interrupted", now))
+    state.commit()
+
+    tmp: Path | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix="frigate-event-", suffix=".mp4")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        response = requests.get(
+            frigate_event_clip_url(settings, camera, start, end),
+            stream=True, timeout=settings.frigate_api_timeout)
+        try:
+            response.raise_for_status()
+            with tmp.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+        finally:
+            response.close()
+        size = tmp.stat().st_size
+        if size <= 0:
+            raise RuntimeError(f"Frigate returned an empty entry clip for event {event_id}")
+        with tmp.open("rb") as downloaded:
+            header = downloaded.read(12)
+        if len(header) < 8 or header[4:8] not in {b"ftyp", b"styp"}:
+            raise RuntimeError(
+                f"Frigate response is not an MP4 entry clip for event {event_id}")
+        generated_at = time.time()
+        etag = upload_file(client, settings, tmp, key)
+        head = client.head_object(Bucket=settings.bucket, Key=key)
+        if int(head.get("ContentLength", -1)) != size:
+            raise RuntimeError(
+                f"S3 entry clip size mismatch for event {event_id}: "
+                f"local={size}, remote={head.get('ContentLength')}")
+        uploaded_at = time.time()
+        state.execute("""
+            UPDATE event_clip_delivery
+               SET etag=?,size_bytes=?,generated_at=?,uploaded_at=?,
+                   last_error=NULL,updated_at=?
+             WHERE event_id=? AND bucket=? AND endpoint_url=?""",
+            (etag, size, generated_at, uploaded_at, uploaded_at,
+             event_id, settings.bucket, endpoint))
+        state.commit()
+        return {
+            "source": "frigate_api", "s3_key": key, "etag": etag,
+            "size_bytes": size, "start_time": start, "end_time": end,
+        }
+    except Exception as exc:
+        state.execute("""
+            UPDATE event_clip_delivery
+               SET last_error=?,updated_at=?
+             WHERE event_id=? AND bucket=? AND endpoint_url=?""",
+            (str(exc), time.time(), event_id, settings.bucket, endpoint))
+        state.commit()
+        raise
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 NOTION_API = "https://api.notion.com/v1"
@@ -603,18 +774,25 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
     event_id = row["event_id"]
     clip_attempts = int(row["clip_attempts"])
 
-    keys = [r["s3_key"] for r in state.execute(
+    generated = state.execute("""
+        SELECT s3_key
+          FROM event_clip_delivery
+         WHERE event_id=? AND bucket=? AND endpoint_url=?
+           AND uploaded_at IS NOT NULL AND s3_key IS NOT NULL""",
+        (event_id, settings.bucket, settings.endpoint_url or "")).fetchone()
+    keys = [] if generated else [r["s3_key"] for r in state.execute(
         "SELECT s3_key FROM segment_delivery WHERE event_id=? AND uploaded_at IS NOT NULL ORDER BY s3_key",
         (event_id,))]
-    if not keys:
-        # A synced page with no delivered segments can never get a working link; charge it
-        # so it retires instead of looping forever, with a diagnosis in last_error.
+    if generated is None and not keys:
         state.execute("UPDATE notion_delivery SET clip_attempts=?,updated_at=? WHERE event_id=?",
                       (clip_attempts + 1, time.time(), event_id))
-        record_notion_error(state, event_id,
-                            RuntimeError(f"clip link: no delivered segments recorded for event {event_id}"))
-        LOG.warning("Clip link found no delivered segments for event %s (attempt %s/%s)",
-                    event_id, clip_attempts + 1, settings.notion_max_attempts)
+        record_notion_error(
+            state, event_id,
+            RuntimeError(
+                f"clip link: no delivered segments or event clip recorded for event {event_id}"))
+        LOG.warning(
+            "Clip link found no delivered segments or event clip for event %s (attempt %s/%s)",
+            event_id, clip_attempts + 1, settings.notion_max_attempts)
         return True, None
 
     page_id = row["page_id"]
@@ -657,13 +835,16 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
                    time.time(), event_id))
     state.commit()
     try:
-        videos = [(k.rsplit("/", 1)[-1], presign_get(signer, settings, k)) for k in keys]
-        page_key = clip_page_key(settings, str(row["camera"]), event_id)
-        client.put_object(Bucket=settings.bucket, Key=page_key,
-                          Body=render_player(event_id, videos).encode(),
-                          ContentType="text/html; charset=utf-8",
-                          CacheControl="no-store")
-        page_url = presign_get(signer, settings, page_key)
+        if generated is not None:
+            page_url = presign_get(signer, settings, str(generated["s3_key"]))
+        else:
+            videos = [(k.rsplit("/", 1)[-1], presign_get(signer, settings, k)) for k in keys]
+            page_key = clip_page_key(settings, str(row["camera"]), event_id)
+            client.put_object(Bucket=settings.bucket, Key=page_key,
+                              Body=render_player(event_id, videos).encode(),
+                              ContentType="text/html; charset=utf-8",
+                              CacheControl="no-store")
+            page_url = presign_get(signer, settings, page_key)
         notion_request("PATCH", f"/pages/{page_id}", settings,
                        {"properties": {"Clip": {"url": page_url}}})
     except Exception as exc:
@@ -1277,56 +1458,117 @@ def slack_people_summary_now(settings: Settings, target_date: str | None = None)
     return 0
 
 
-def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_table: str, recording_cols: set[str], state: sqlite3.Connection, client, settings: Settings) -> None:
+def process_event(event: dict[str, Any], fconn: sqlite3.Connection,
+                  recording_table: str, recording_cols: set[str],
+                  state: sqlite3.Connection, client, settings: Settings) -> None:
     event_id = str(event["id"])
-    done = state.execute("SELECT completed_at,manifest_key FROM event_delivery WHERE event_id=?", (event_id,)).fetchone()
+    done = state.execute(
+        "SELECT completed_at,manifest_key FROM event_delivery WHERE event_id=?",
+        (event_id,)).fetchone()
     if done and done["completed_at"] is not None:
-        segments_done = state.execute("SELECT COUNT(*) FROM segment_delivery WHERE event_id=? AND uploaded_at IS NOT NULL", (event_id,)).fetchone()[0]
-        sync_notion(event, done["manifest_key"], segments_done, state, settings)
+        generated_done = state.execute("""
+            SELECT 1 FROM event_clip_delivery
+             WHERE event_id=? AND bucket=? AND endpoint_url=?
+               AND uploaded_at IS NOT NULL""",
+            (event_id, settings.bucket, settings.endpoint_url or "")).fetchone()
+        media_count = 1 if generated_done else state.execute(
+            "SELECT COUNT(*) FROM segment_delivery "
+            "WHERE event_id=? AND uploaded_at IS NOT NULL",
+            (event_id,)).fetchone()[0]
+        sync_notion(event, done["manifest_key"], media_count, state, settings)
         return
-    start = float(event["start_time"]) - settings.pre_roll
-    end = float(event["end_time"]) + settings.post_roll
-    segments = fetch_segments(fconn, recording_table, recording_cols, str(event["camera"]), start, end)
+
+    if settings.clip_source == "frigate_api":
+        start, end = event_clip_window(event, settings)
+        segments: list[dict[str, Any]] = []
+    else:
+        start = float(event["start_time"]) - settings.pre_roll
+        end = float(event["end_time"]) + settings.post_roll
+        segments = fetch_segments(
+            fconn, recording_table, recording_cols,
+            str(event["camera"]), start, end)
+
     now = time.time()
-    # recorded_at is deliberately NOT in the conflict clause: it marks when this event first
-    # entered the state DB, which is what scopes it into exactly one Slack summary window.
-    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,face_detected,recorded_at,updated_at)
-                     VALUES(?,?,?,?,?,?,?,?)
-                     ON CONFLICT(event_id) DO UPDATE SET person=excluded.person,face_detected=excluded.face_detected,updated_at=excluded.updated_at,last_error=NULL""",
-                  (event_id, event["camera"], event["start_time"], event["end_time"],
-                   recognized_person(event), int(has_detected_face(event)), now, now))
+    # recorded_at is deliberately NOT in the conflict clause: it marks when this
+    # event first entered the state DB, which scopes it into one Slack window.
+    state.execute("""
+        INSERT INTO event_delivery(
+          event_id,camera,start_time,end_time,person,face_detected,recorded_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(event_id) DO UPDATE SET
+          person=excluded.person,face_detected=excluded.face_detected,
+          updated_at=excluded.updated_at,last_error=NULL""",
+        (event_id, event["camera"], event["start_time"], event["end_time"],
+         recognized_person(event), int(has_detected_face(event)), now, now))
     state.commit()
-    if not segments:
-        raise RuntimeError(f"No recording segments overlap event {event_id} window {utc_iso(start)} to {utc_iso(end)}")
 
-    uploaded = []
-    for seg in segments:
-        path = canonical_path(str(seg["path"]), settings.recordings_dir)
-        if not path.exists():
-            raise FileNotFoundError(f"Indexed recording does not exist: {path}")
-        age = time.time() - path.stat().st_mtime
-        if age < settings.settle_seconds:
-            raise RuntimeError(f"Recording is still settling ({age:.1f}s old): {path}")
-        rel = relative_recording_key(path, settings.recordings_dir)
-        key = f"{settings.prefix}/recordings/{rel}" if settings.prefix else f"recordings/{rel}"
-        previous = state.execute("SELECT uploaded_at,etag FROM segment_delivery WHERE event_id=? AND source_path=?", (event_id, str(path))).fetchone()
-        etag = previous["etag"] if previous and previous["uploaded_at"] else upload_file(client, settings, path, key)
-        if not settings.dry_run and not (previous and previous["uploaded_at"]):
-            state.execute("""INSERT INTO segment_delivery(event_id,source_path,s3_key,etag,uploaded_at)
-                             VALUES(?,?,?,?,?)
-                             ON CONFLICT(event_id,source_path) DO UPDATE SET s3_key=excluded.s3_key,etag=excluded.etag,uploaded_at=excluded.uploaded_at""",
-                          (event_id, str(path), key, etag, time.time()))
-            state.commit()
-        uploaded.append({
-            "source_path": str(path), "s3_key": key,
-            "start_time": seg.get("start_time"), "start_time_utc": utc_iso(seg.get("start_time")),
-            "end_time": seg.get("end_time"), "end_time_utc": utc_iso(seg.get("end_time")),
-            "etag": etag,
-        })
+    generated_clip: dict[str, Any] | None = None
+    uploaded: list[dict[str, Any]] = []
+    if settings.clip_source == "frigate_api":
+        generated_clip = deliver_event_clip(event, state, client, settings)
+    else:
+        if not segments:
+            raise RuntimeError(
+                f"No recording segments overlap event {event_id} window "
+                f"{utc_iso(start)} to {utc_iso(end)}")
+        for seg in segments:
+            path = canonical_path(str(seg["path"]), settings.recordings_dir)
+            if not path.exists():
+                raise FileNotFoundError(f"Indexed recording does not exist: {path}")
+            age = time.time() - path.stat().st_mtime
+            if age < settings.settle_seconds:
+                raise RuntimeError(
+                    f"Recording is still settling ({age:.1f}s old): {path}")
+            rel = relative_recording_key(path, settings.recordings_dir)
+            key = (f"{settings.prefix}/recordings/{rel}" if settings.prefix
+                   else f"recordings/{rel}")
+            previous = state.execute(
+                "SELECT uploaded_at,etag FROM segment_delivery "
+                "WHERE event_id=? AND source_path=?",
+                (event_id, str(path))).fetchone()
+            etag = (previous["etag"] if previous and previous["uploaded_at"]
+                    else upload_file(client, settings, path, key))
+            if not settings.dry_run and not (
+                    previous and previous["uploaded_at"]):
+                state.execute("""
+                    INSERT INTO segment_delivery(
+                      event_id,source_path,s3_key,etag,uploaded_at)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(event_id,source_path) DO UPDATE SET
+                      s3_key=excluded.s3_key,etag=excluded.etag,
+                      uploaded_at=excluded.uploaded_at""",
+                    (event_id, str(path), key, etag, time.time()))
+                state.commit()
+            uploaded.append({
+                "source_path": str(path), "s3_key": key,
+                "start_time": seg.get("start_time"),
+                "start_time_utc": utc_iso(seg.get("start_time")),
+                "end_time": seg.get("end_time"),
+                "end_time_utc": utc_iso(seg.get("end_time")),
+                "etag": etag,
+            })
 
-    manifest_key = f"{settings.prefix}/events/{event['camera']}/{event_id}/manifest.json" if settings.prefix else f"events/{event['camera']}/{event_id}/manifest.json"
-    manifest = {
-        "schema_version": 1,
+    manifest_key = (
+        f"{settings.prefix}/events/{event['camera']}/{event_id}/manifest.json"
+        if settings.prefix else
+        f"events/{event['camera']}/{event_id}/manifest.json")
+    if generated_clip:
+        archive_window = {
+            "start_time": start, "start_time_utc": utc_iso(start),
+            "end_time": end, "end_time_utc": utc_iso(end),
+            "mode": "entry",
+            "pre_roll_seconds": settings.event_clip_pre_roll,
+            "duration_seconds": end - start,
+        }
+    else:
+        archive_window = {
+            "start_time": start, "start_time_utc": utc_iso(start),
+            "end_time": end, "end_time_utc": utc_iso(end),
+            "pre_roll_seconds": settings.pre_roll,
+            "post_roll_seconds": settings.post_roll,
+        }
+    manifest: dict[str, Any] = {
+        "schema_version": 2 if generated_clip else 1,
         "generated_at": utc_iso(time.time()),
         "source": "fregata-sqlite-reconciler",
         "event": {
@@ -1334,22 +1576,135 @@ def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_ta
             "start_time_utc": utc_iso(event.get("start_time")),
             "end_time_utc": utc_iso(event.get("end_time")),
         },
-        "archive_window": {
-            "start_time": start, "start_time_utc": utc_iso(start),
-            "end_time": end, "end_time_utc": utc_iso(end),
-            "pre_roll_seconds": settings.pre_roll,
-            "post_roll_seconds": settings.post_roll,
-        },
+        "archive_window": archive_window,
         "segments": uploaded,
     }
+    if generated_clip:
+        manifest["clip"] = {
+            "source": "frigate_api",
+            "s3_key": generated_clip["s3_key"],
+            "size_bytes": generated_clip["size_bytes"],
+            "etag": generated_clip["etag"],
+        }
     if settings.upload_manifest:
         upload_manifest(client, settings, manifest_key, manifest)
     if not settings.dry_run:
-        state.execute("UPDATE event_delivery SET manifest_key=?,completed_at=?,last_error=NULL,updated_at=? WHERE event_id=?",
-                      (manifest_key if settings.upload_manifest else None, time.time(), time.time(), event_id))
+        state.execute("""
+            UPDATE event_delivery
+               SET manifest_key=?,completed_at=?,last_error=NULL,updated_at=?
+             WHERE event_id=?""",
+            (manifest_key if settings.upload_manifest else None,
+             time.time(), time.time(), event_id))
         state.commit()
-    LOG.info("%s event %s with %d segment(s)", "Planned" if settings.dry_run else "Completed", event_id, len(uploaded))
-    sync_notion(event, manifest_key if settings.upload_manifest else None, len(uploaded), state, settings)
+    media_count = 1 if generated_clip else len(uploaded)
+    LOG.info("%s event %s with %d %s",
+             "Planned" if settings.dry_run else "Completed",
+             event_id, media_count,
+             "entry clip" if generated_clip else "segment(s)")
+    sync_notion(
+        event, manifest_key if settings.upload_manifest else None,
+        media_count, state, settings)
+
+
+def event_clips_backfill(settings: Settings, target_date: str | None,
+                         apply: bool = False) -> int:
+    """Generate missing entry clips for one local calendar day."""
+    if not target_date:
+        print("event-clips-backfill requires --date YYYY-MM-DD")
+        return 1
+    try:
+        since, until, _ = parse_date_window(target_date)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    if apply and settings.dry_run:
+        print("DRY_RUN=false is required with event-clips-backfill --apply")
+        return 1
+
+    snap = snapshot_db(settings.source_db)
+    state = open_state(settings.state_db)
+    fconn: sqlite3.Connection | None = None
+    counts = {
+        "would_generate": 0, "generated": 0, "already_generated": 0,
+        "not_delivered": 0, "source_unavailable": 0, "failed": 0,
+    }
+    try:
+        fconn = sqlite3.connect(snap)
+        fconn.row_factory = sqlite3.Row
+        table, cols = resolve_table(
+            fconn, ("event", "events"), EVENT_REQUIRED)
+        select_cols = [
+            c for c in (
+                "id", "camera", "label", "sub_label", "start_time",
+                "end_time", "top_score", "false_positive", "zones",
+                "has_clip", "has_snapshot", "data")
+            if c in cols
+        ]
+        where = [
+            "start_time >= ?", "start_time <= ?",
+            "end_time IS NOT NULL", "label = ?",
+        ]
+        params: list[Any] = [since, until, settings.label]
+        if settings.camera:
+            where.append("camera = ?")
+            params.append(settings.camera)
+        rows = fconn.execute(
+            f"SELECT {', '.join(qident(c) for c in select_cols)} "
+            f"FROM {qident(table)} WHERE {' AND '.join(where)} "
+            "ORDER BY start_time",
+            params).fetchall()
+        client = s3_client(settings) if apply else None
+        endpoint = settings.endpoint_url or ""
+        for row in rows:
+            event = dict(row)
+            for key in ("data", "zones", "sub_label"):
+                if key in event:
+                    event[key] = parse_json(event[key])
+            event_id = str(event["id"])
+            delivered = state.execute(
+                "SELECT completed_at FROM event_delivery WHERE event_id=?",
+                (event_id,)).fetchone()
+            if not delivered or delivered["completed_at"] is None:
+                counts["not_delivered"] += 1
+                continue
+            existing = state.execute("""
+                SELECT uploaded_at FROM event_clip_delivery
+                 WHERE event_id=? AND bucket=? AND endpoint_url=?""",
+                (event_id, settings.bucket, endpoint)).fetchone()
+            if existing and existing["uploaded_at"] is not None:
+                counts["already_generated"] += 1
+                continue
+            if not apply:
+                counts["would_generate"] += 1
+                continue
+            try:
+                deliver_event_clip(event, state, client, settings)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    counts["source_unavailable"] += 1
+                else:
+                    counts["failed"] += 1
+                LOG.warning("Entry clip backfill failed for event %s: %s",
+                            event_id, exc)
+                continue
+            except Exception as exc:
+                counts["failed"] += 1
+                LOG.warning("Entry clip backfill failed for event %s: %s",
+                            event_id, exc)
+                continue
+            state.execute("""
+                UPDATE notion_delivery
+                   SET clip_signed_at=NULL,clip_attempts=0,updated_at=?
+                 WHERE event_id=?""", (time.time(), event_id))
+            state.commit()
+            counts["generated"] += 1
+        print(json.dumps(counts, indent=2))
+        return 1 if counts["failed"] else 0
+    finally:
+        if fconn is not None:
+            fconn.close()
+        state.close()
+        snap.unlink(missing_ok=True)
 
 
 def inspect(settings: Settings) -> int:
@@ -1410,6 +1765,11 @@ def status(settings: Settings) -> int:
         complete = state.execute("SELECT COUNT(*) FROM event_delivery WHERE completed_at IS NOT NULL").fetchone()[0]
         failed = state.execute("SELECT COUNT(*) FROM event_delivery WHERE last_error IS NOT NULL").fetchone()[0]
         segments = state.execute("SELECT COUNT(*) FROM segment_delivery WHERE uploaded_at IS NOT NULL").fetchone()[0]
+        event_clips = state.execute(
+            "SELECT COUNT(*) FROM event_clip_delivery WHERE uploaded_at IS NOT NULL").fetchone()[0]
+        event_clip_failed = state.execute(
+            "SELECT COUNT(*) FROM event_clip_delivery "
+            "WHERE uploaded_at IS NULL AND last_error IS NOT NULL").fetchone()[0]
         notion_synced = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL").fetchone()[0]
         notion_failed = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NULL AND last_error IS NOT NULL").fetchone()[0]
         notion_gaveup = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NULL AND attempts>=?", (settings.notion_max_attempts,)).fetchone()[0]
@@ -1421,7 +1781,9 @@ def status(settings: Settings) -> int:
                                    (fresh_cutoff, settings.notion_max_attempts)).fetchone()[0]
         clip_gaveup = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL AND clip_attempts >= ?", (settings.notion_max_attempts,)).fetchone()[0]
         last_summary = get_meta(state, SLACK_SENT_AT_KEY)
-        print(json.dumps({"events_seen": total, "events_complete": complete, "events_failed": failed, "segments_uploaded": segments,
+        print(json.dumps({"events_seen": total, "events_complete": complete, "events_failed": failed,
+                          "segments_uploaded": segments, "event_clips_uploaded": event_clips,
+                          "event_clips_failed": event_clip_failed,
                           "notion_synced": notion_synced, "notion_failed": notion_failed, "notion_gave_up": notion_gaveup,
                           "clip_fresh": clip_fresh, "clip_stale": clip_stale, "clip_gave_up": clip_gaveup,
                           "slack_last_summary": utc_iso(float(last_summary)) if last_summary else None,
@@ -1434,6 +1796,11 @@ def status(settings: Settings) -> int:
         # without this, clip_gave_up climbing would be a number with no diagnosis attached.
         for row in state.execute("SELECT event_id,last_error FROM notion_delivery WHERE synced_at IS NOT NULL AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10"):
             print(f"CLIP FAILED {row['event_id']}: {row['last_error']}")
+        for row in state.execute(
+                "SELECT event_id,last_error FROM event_clip_delivery "
+                "WHERE uploaded_at IS NULL AND last_error IS NOT NULL "
+                "ORDER BY updated_at DESC LIMIT 10"):
+            print(f"EVENT CLIP FAILED {row['event_id']}: {row['last_error']}")
         return 0
     finally:
         state.close()
@@ -1458,9 +1825,20 @@ def clips_reset(settings: Settings) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reconcile Fregata events and recording segments to S3")
-    parser.add_argument("command", choices=("inspect", "once", "watch", "status", "clips-reset", "slack-summary", "slack-people-summary"))
-    parser.add_argument("date", nargs="?", help="Optional date for Slack summary commands (YYYY-MM-DD, e.g. 2026-08-19)")
-    parser.add_argument("--date", dest="opt_date", help="Optional date for Slack summary commands (YYYY-MM-DD)")
+    parser.add_argument(
+        "command",
+        choices=("inspect", "once", "watch", "status", "clips-reset",
+                 "slack-summary", "slack-people-summary",
+                 "event-clips-backfill"))
+    parser.add_argument(
+        "date", nargs="?",
+        help="Optional date for summary/backfill commands (YYYY-MM-DD)")
+    parser.add_argument("--date", dest="opt_date", help="Date in YYYY-MM-DD")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="Apply event-clips-backfill (default is dry-run)")
+    mode.add_argument("--dry-run", dest="backfill_dry_run", action="store_true",
+                      help="Explicit dry-run for event-clips-backfill")
     args = parser.parse_args()
     settings = Settings.from_env()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
@@ -1473,6 +1851,9 @@ def main() -> int:
     if args.command == "slack-people-summary":
         target = args.date or args.opt_date
         return slack_people_summary_now(settings, target_date=target)
+    if args.command == "event-clips-backfill":
+        target = args.date or args.opt_date
+        return event_clips_backfill(settings, target, apply=args.apply)
     if args.command == "once": return run_once(settings)
     while True:
         try:
