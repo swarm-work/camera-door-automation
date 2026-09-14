@@ -23,8 +23,12 @@ def clean_env(monkeypatch):
         "PRE_ROLL_SECONDS", "POST_ROLL_SECONDS", "POLL_SECONDS", "SETTLE_SECONDS",
         "DRY_RUN", "UPLOAD_EVENT_MANIFEST", "NOTION_TOKEN", "NOTION_DATABASE_ID",
         "NOTION_VERSION", "CLIP_LINKS", "CLIP_URL_TTL_SECONDS", "CLIP_REFRESH_SECONDS",
-        "CLIP_AWS_ACCESS_KEY_ID", "CLIP_AWS_SECRET_ACCESS_KEY",
+        "CLIP_AWS_ACCESS_KEY_ID", "CLIP_AWS_SECRET_ACCESS_KEY", "CLIP_SOURCE",
+        "FRIGATE_API_URL", "FRIGATE_API_TIMEOUT_SECONDS",
+        "EVENT_CLIP_PRE_ROLL_SECONDS", "EVENT_CLIP_DURATION_SECONDS",
         "SLACK_WEBHOOK_URL", "SLACK_SUMMARY_TIME", "SLACK_SUMMARY_ON_EMPTY",
+        "SLACK_INCLUDE_KNOWN", "SLACK_INCLUDE_SNAPSHOTS",
+        "SLACK_UNKNOWN_REQUIRES_FACE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -43,6 +47,11 @@ def test_defaults_are_safe(monkeypatch):
     assert (s.poll_seconds, s.settle_seconds) == (30.0, 5.0)
     assert s.notion_token is None and s.notion_database_id is None
     assert s.clip_links is False, "clip links must be opt-in"
+    assert s.slack_unknown_requires_face is False
+    assert s.clip_source == "segments"
+    assert s.frigate_api_url == "http://127.0.0.1:5000/api"
+    assert s.frigate_api_timeout == 120.0
+    assert (s.event_clip_pre_roll, s.event_clip_duration) == (3.0, 15.0)
 
 
 def test_manifest_upload_defaults_off(monkeypatch):
@@ -50,6 +59,41 @@ def test_manifest_upload_defaults_off(monkeypatch):
     .env.example's own header recommends for unwanted settings, must not enable it."""
     assert rec.Settings.from_env().upload_manifest is False
 
+def test_unknown_face_filter_is_opt_in(monkeypatch):
+    monkeypatch.setenv("SLACK_UNKNOWN_REQUIRES_FACE", "true")
+    assert rec.Settings.from_env().slack_unknown_requires_face is True
+
+
+def test_frigate_api_clip_settings(monkeypatch):
+    monkeypatch.setenv("CLIP_SOURCE", "frigate_api")
+    monkeypatch.setenv("FRIGATE_API_URL", "http://frigate.local:5000/api/")
+    monkeypatch.setenv("FRIGATE_API_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("EVENT_CLIP_PRE_ROLL_SECONDS", "2")
+    monkeypatch.setenv("EVENT_CLIP_DURATION_SECONDS", "12")
+    settings = rec.Settings.from_env()
+    assert settings.clip_source == "frigate_api"
+    assert settings.frigate_api_url == "http://frigate.local:5000/api"
+    assert settings.frigate_api_timeout == 30
+    assert settings.event_clip_pre_roll == 2
+    assert settings.event_clip_duration == 12
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("CLIP_SOURCE", "mystery"),
+    ("FRIGATE_API_TIMEOUT_SECONDS", "0"),
+    ("EVENT_CLIP_PRE_ROLL_SECONDS", "-1"),
+    ("EVENT_CLIP_DURATION_SECONDS", "0"),
+])
+def test_invalid_frigate_api_clip_settings_are_rejected(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        rec.Settings.from_env()
+
+def test_frigate_api_mode_requires_absolute_url(monkeypatch):
+    monkeypatch.setenv("CLIP_SOURCE", "frigate_api")
+    monkeypatch.setenv("FRIGATE_API_URL", "localhost:5000/api")
+    with pytest.raises(ValueError, match="absolute http"):
+        rec.Settings.from_env()
 
 def test_clip_ttl_is_clamped_to_the_sigv4_maximum(monkeypatch):
     monkeypatch.setenv("CLIP_URL_TTL_SECONDS", "999999999")

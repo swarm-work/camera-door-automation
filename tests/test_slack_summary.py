@@ -29,11 +29,12 @@ def http():
         yield m
 
 
-def seed_event(state, event_id, *, person=None, recorded_at=NOW, camera="door_camera",
+def seed_event(state, event_id, *, person=None, face_detected=False,
+               recorded_at=NOW, camera="door_camera",
                start=NOW, end=NOW + 20.0, completed=True):
-    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,recorded_at,completed_at,updated_at)
-                     VALUES(?,?,?,?,?,?,?,?)""",
-                  (event_id, camera, start, end, person, recorded_at,
+    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,face_detected,recorded_at,completed_at,updated_at)
+                     VALUES(?,?,?,?,?,?,?,?,?)""",
+                  (event_id, camera, start, end, person, int(face_detected), recorded_at,
                    NOW if completed else None, NOW))
     state.commit()
 
@@ -75,7 +76,7 @@ def test_old_state_db_gains_the_new_columns(settings_factory):
     state = rec.open_state(path)
     try:
         cols = rec.table_columns(state, "event_delivery")
-        assert {"person", "recorded_at"} <= cols
+        assert {"person", "face_detected", "recorded_at"} <= cols
         rec.set_meta(state, "probe", "ok")
     finally:
         state.close()
@@ -87,6 +88,16 @@ def test_recognized_person_extraction():
     assert rec.recognized_person({"sub_label": None}) is None
     assert rec.recognized_person({}) is None
     assert rec.recognized_person({"sub_label": ["Alice", 0.9]}) is None
+
+def test_detected_face_extraction():
+    assert rec.has_detected_face({
+        "data": {"attributes": [{"label": "face", "score": 0.91}]}})
+    assert rec.has_detected_face({
+        "data": '{"attributes": [{"label": "FACE", "score": 0.91}]}'})
+    assert not rec.has_detected_face({"data": {"attributes": []}})
+    assert not rec.has_detected_face({"data": {"attributes": None}})
+    assert not rec.has_detected_face({"data": {"attributes": [{"label": "hat"}]}})
+    assert not rec.has_detected_face({})
 
 
 # --------------------------------------------------------------------------
@@ -140,6 +151,48 @@ def test_recognized_people_are_excluded(state_db, slack_settings, http):
     text = posted_text(http)
     assert "1 unknown visitor" in text
     assert "Alice" not in text, "a recognized name must never reach Slack"
+
+def test_face_filter_excludes_back_facing_unknown_person(state_db, settings_factory, http):
+    settings = settings_factory(
+        dry_run=False,
+        slack_webhook_url=WEBHOOK,
+        slack_unknown_requires_face=True,
+    )
+    now, cursor = anchor(settings)
+    build_source_db(settings.source_db, events=[
+        make_event(
+            id="face-visible",
+            data='{"attributes": [{"label": "face", "score": 0.91}]}',
+        ),
+        make_event(
+            id="back-facing",
+            start_time=NOW + 30.0,
+            end_time=NOW + 50.0,
+            data='{"attributes": []}',
+        ),
+    ])
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "face-visible", recorded_at=cursor + 10.0)
+    seed_event(state_db, "back-facing", recorded_at=cursor + 20.0)
+    state_db.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)
+                        VALUES('face-visible','visible-page-id',?,?)""", (NOW, NOW))
+    state_db.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)
+                        VALUES('back-facing','back-page-id',?,?)""", (NOW, NOW))
+    state_db.commit()
+
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+
+    text = posted_text(http)
+    assert "1 unknown visitor" in text
+    assert "visiblepageid" in text
+    assert "backpageid" not in text
+    rows = {
+        row["event_id"]: row["face_detected"]
+        for row in state_db.execute(
+            "SELECT event_id,face_detected FROM event_delivery")
+    }
+    assert rows == {"face-visible": 1, "back-facing": 0}
 
 
 def test_quiet_day_posts_nothing_but_advances_the_cursor(state_db, slack_settings, http):
@@ -420,15 +473,21 @@ def test_slack_summary_for_specific_date(settings_factory, http):
 
 
 
-def test_specific_date_refreshes_person_from_source_before_unknown_filter(settings_factory, http):
-    """Old state rows with NULL person must not make known visitors look unknown."""
-    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=False)
+def test_specific_date_refreshes_classification_before_unknown_filter(settings_factory, http):
+    """Old state rows must use final source identity and face-presence metadata."""
+    settings = settings_factory(
+        dry_run=False,
+        slack_webhook_url=WEBHOOK,
+        slack_include_known=False,
+        slack_unknown_requires_face=True,
+    )
     start_19, _, _ = rec.parse_date_window("2026-08-19")
     build_source_db(settings.source_db, events=[
         make_event(id="e_known", start_time=start_19 + 60.0, end_time=start_19 + 80.0,
                    sub_label="Alice"),
         make_event(id="e_unknown", start_time=start_19 + 120.0, end_time=start_19 + 150.0,
-                   sub_label=None),
+                   sub_label=None,
+                   data='{"attributes": [{"label": "face", "score": 0.88}]}'),
     ])
     state = rec.open_state(settings.state_db)
     try:
@@ -453,9 +512,15 @@ def test_specific_date_refreshes_person_from_source_before_unknown_filter(settin
 
     state = rec.open_state(settings.state_db)
     try:
-        person = state.execute(
-            "SELECT person FROM event_delivery WHERE event_id='e_known'").fetchone()[0]
-        assert person == "Alice"
+        rows = {
+            row["event_id"]: (row["person"], row["face_detected"])
+            for row in state.execute(
+                "SELECT event_id,person,face_detected FROM event_delivery")
+        }
+        assert rows == {
+            "e_known": ("Alice", 0),
+            "e_unknown": (None, 1),
+        }
     finally:
         state.close()
 

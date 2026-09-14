@@ -241,9 +241,11 @@ def test_status_on_a_fresh_install(settings_factory, capsys):
     assert rec.status(settings_factory()) == 0
     out = json.loads(capsys.readouterr().out)
     assert out == {"events_seen": 0, "events_complete": 0, "events_failed": 0,
-                   "segments_uploaded": 0, "notion_synced": 0, "notion_failed": 0,
-                   "notion_gave_up": 0, "clip_fresh": 0, "clip_stale": 0,
-                   "clip_gave_up": 0, "slack_last_summary": None, "dry_run": False}
+                   "segments_uploaded": 0, "event_clips_uploaded": 0,
+                   "event_clips_failed": 0, "notion_synced": 0,
+                   "notion_failed": 0, "notion_gave_up": 0, "clip_fresh": 0,
+                   "clip_stale": 0, "clip_gave_up": 0,
+                   "slack_last_summary": None, "dry_run": False}
 
 
 def test_status_counts_each_category(source_with, use_session_s3, segment_file, capsys):
@@ -368,6 +370,15 @@ def test_slack_people_summary_command_dispatches_with_date(monkeypatch, cli):
                         lambda s, target_date=None: called.append(target_date) or 7)
     assert cli(["slack-people-summary", "2026-08-19"]) == 7
     assert called == ["2026-08-19"]
+
+def test_event_clip_backfill_dispatches_with_date_and_apply(monkeypatch, cli):
+    called = []
+    monkeypatch.setattr(
+        rec, "event_clips_backfill",
+        lambda settings, target_date, apply=False:
+        called.append((target_date, apply)) or 7)
+    assert cli(["event-clips-backfill", "--date", "2026-08-19", "--apply"]) == 7
+    assert called == [("2026-08-19", True)]
 
 def test_an_unknown_command_is_rejected(cli):
     with pytest.raises(SystemExit) as exc:

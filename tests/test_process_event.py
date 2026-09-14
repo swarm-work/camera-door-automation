@@ -55,6 +55,33 @@ def test_marks_the_event_complete(pipeline, segment_file):
     assert row["camera"] == "door_camera"
 
 
+def test_records_whether_frigate_detected_a_face(pipeline, segment_file):
+    segment_file("door_camera/seg-1.mp4")
+    w = pipeline(
+        events=[
+            make_event(
+                id="face-visible",
+                data='{"attributes": [{"label": "face", "score": 0.91}]}',
+            ),
+            make_event(
+                id="back-facing",
+                start_time=NOW + 30.0,
+                end_time=NOW + 50.0,
+                data='{"attributes": []}',
+            ),
+        ],
+        recordings=[seg_row("door_camera/seg-1.mp4")],
+    )
+    for event in w.events():
+        w.run(event)
+
+    rows = {
+        row["event_id"]: row["face_detected"]
+        for row in w.state.execute(
+            "SELECT event_id,face_detected FROM event_delivery")
+    }
+    assert rows == {"face-visible": 1, "back-facing": 0}
+
 def test_records_every_uploaded_segment(pipeline, segment_file):
     a = segment_file("door_camera/seg-1.mp4")
     b = segment_file("door_camera/seg-2.mp4")

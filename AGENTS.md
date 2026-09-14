@@ -7,14 +7,16 @@ presigned clip link. Everything else in the repo supports that one file.
 
 ## Map
 
-- `reconciler.py` — the whole service: `Settings`, S3, Notion, clip links, CLI.
-  The frozen `Settings` dataclass is the single injection seam; every function
-  takes it, and the tests rely on that.
+- `reconciler.py` — the live service: `Settings`, S3, Notion, legacy segment
+  links, generated entry clips, Slack, and CLI. The frozen `Settings` dataclass
+  is its injection seam.
+- `face_gallery.py` — independent dry-run-first export/verify/staging-restore
+  CLI for approved face-library images; it never runs inside `watch`.
 - `ARCHITECTURE.md` — the pipeline in two diagrams: the system data flow and
   the ER model of the Fregata tables, the state DB, and the Notion properties.
-- `.env.example` — the authoritative register of every variable the service
-  reads ("anything not listed here is ignored") and the reasoning behind each
-  default. Any change to configuration lands here in the same commit.
+- `.env.example` — the authoritative register of every variable either CLI
+  reads and the reasoning behind each default. Configuration changes land here
+  in the same commit.
 - `tests/` — hermetic pytest suite; `tests/README.md` covers fixtures and
   conventions (moto for S3, `responses` for Notion, no network ever).
 - `CODE-REVIEW.md` — numbered ledger of known defects; each maps to an xfail.
@@ -38,9 +40,9 @@ Green looks like "N passed, M xfailed" — the xfails are documented defects
 (next section), never flakes. Coverage:
 `coverage run --source=reconciler -m pytest && coverage report -m`.
 
-CLI: `python3 reconciler.py {inspect,once,watch,status,clips-reset}` — see
-`README.md` for what each does. There is no live NVR or bucket in a dev
-environment, so exercise behaviour through the tests, not by running `once`.
+CLI: `python3 reconciler.py {inspect,once,watch,status,clips-reset,slack-summary,slack-people-summary,event-clips-backfill}`
+and `python3 face_gallery.py {export,verify,restore}`. There is no live NVR or
+bucket in a dev environment, so exercise behavior through tests, not `once`.
 
 ## The defect ledger
 
@@ -59,23 +61,21 @@ path defaults to publishing nothing about who they are:
 
 - `sub_label` is a real person's name from face recognition. It reaches Notion
   only under `NOTION_INCLUDE_PERSON=true` and the S3 manifest only under
-  `UPLOAD_EVENT_MANIFEST=true` — both default off in code as well as in
-  `.env.example`, so a deleted line stays off. Any new output path (logs,
-  messages, files committed to this public repo) starts name-free the same way.
-- The Slack end-of-day summary (branch `slack-daily-summary`, PR #8, unmerged)
-  has a fixed contract: one digest per day of *unrecognized* visitors only —
-  no per-event pings, no personal names, no presigned URLs; each line links to
-  the event's access-controlled Notion page instead. Changes touching Slack
-  preserve that contract.
+  `UPLOAD_EVENT_MANIFEST=true`; both default off.
+- The local state DB stores classification needed for summaries. Approved face
+  exports contain names and biometric images inside encrypted-at-rest objects,
+  but never in S3 object keys or routine logs; `train` is excluded.
+- Slack summaries default to unrecognized visitors, while familiar-person names
+  and snapshots require separate explicit flags. Presigned snapshot thumbnails
+  expire and must never be made public merely for Slack persistence.
 
-**Clip links are presigned, not served.** No server, no VPN, no tailscale —
-the link in Notion is a presigned S3 URL to a viewer page in the bucket, and
-the same poll loop that uploads footage re-signs any link older than
-`CLIP_REFRESH_SECONDS`. A presigned URL is a bearer token and re-signing never
-revokes: the kill switch is deactivating the dedicated read-only signing key
-(`CLIP_AWS_*`). The "Know what you are enabling" list in `README.md` is the
-threat model — keep it true when changing this area. Recovery from a broken
-setup is `clips-reset`, which re-signs everything on the next pass.
+**Clip links are presigned, not served.** In legacy `segments` mode, Notion
+links to a presigned S3 viewer page containing presigned segment URLs. When a
+current-destination `event_clip_delivery` exists, Notion instead receives one
+presigned generated MP4 URL. The same poll loop refreshes stale links.
+Presigned URLs are bearer tokens and re-signing never revokes; the kill switch
+is the dedicated read-only `CLIP_AWS_*` key. `clips-reset` resets link state
+only and must never regenerate media.
 
 **Delivery ordering.** In `run_once`, `refresh_clip_links` runs *after* the
 delivery loop so a slow Notion day can never delay footage leaving the house.

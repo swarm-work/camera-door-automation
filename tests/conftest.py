@@ -174,12 +174,18 @@ def settings_factory(tmp_path: Path, recordings_dir: Path):
             clip_refresh_seconds=432000,
             clip_aws_access_key_id=None,
             clip_aws_secret_access_key=None,
+            clip_source="segments",
+            frigate_api_url="http://frigate.test/api",
+            frigate_api_timeout=120.0,
+            event_clip_pre_roll=3.0,
+            event_clip_duration=15.0,
             slack_webhook_url=None,
             slack_summary_hour=21,
             slack_summary_minute=0,
             slack_summary_on_empty=False,
             slack_include_known=False,
             slack_include_snapshots=False,
+            slack_unknown_requires_face=False,
         )
         base.update(over)
         return rec.Settings(**base)
@@ -248,9 +254,11 @@ def _s3_client(_moto):
         notion_version="v", notion_include_person=False, notion_max_attempts=5,
         clip_links=False, clip_url_ttl=604800, clip_refresh_seconds=432000,
         clip_aws_access_key_id=None, clip_aws_secret_access_key=None,
+        clip_source="segments", frigate_api_url="http://frigate.test/api",
+        frigate_api_timeout=120, event_clip_pre_roll=3, event_clip_duration=15,
         slack_webhook_url=None, slack_summary_hour=21, slack_summary_minute=0,
         slack_summary_on_empty=False, slack_include_known=False,
-        slack_include_snapshots=False))
+        slack_include_snapshots=False, slack_unknown_requires_face=False))
 
 
 @pytest.fixture

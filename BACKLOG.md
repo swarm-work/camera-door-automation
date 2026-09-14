@@ -5,28 +5,32 @@ problem, why it matters, and any known constraints.
 
 ---
 
-## 1. Single-clip viewer instead of multi-segment HTML
+## 1. Roll out entry-focused single-event clips
 
-**Problem.** The clip viewer page (`render_player`) creates one `<video>` tag
-per recording segment. Frigate stores recordings in short time-based segments
-(typically 10 s), so an event spanning 30 s plus pre/post-roll padding overlaps
-3-5 separate `.mp4` files. The viewer shows them stacked vertically, which is
-awkward - a single continuous playback would be far better.
+**Problem.** The legacy viewer page renders every raw Frigate recording segment
+that overlaps a person event plus padding. Frigate stores short segments, so one
+Notion event can show several videos, including boundary footage where the person
+is absent. Database inspection confirmed that the current Fregata installation
+has no configured audio detector and zero audio Review items; the multiplicity
+comes from raw segment selection, not sound events.
 
-**Why it is hard.** The multiple files are Frigate's fundamental storage model;
-there is no single-clip `.mp4` on disk. Getting one requires either:
+**Implemented behind a safe flag.** `CLIP_SOURCE=frigate_api` requests one short
+MP4 from Frigate's recording-clip API, centered on `event.start_time`, uploads it
+as `events/<camera>/<event_id>/clip.mp4`, and makes Notion prefer that direct
+object. The legacy default remains `CLIP_SOURCE=segments`. Historical generation
+uses the resumable `event-clips-backfill` command.
 
-- **Server-side concatenation** - `ffmpeg -f concat` on the Mac before upload.
-  Pros: the viewer becomes a single `<video>`. Cons: CPU cost on every event,
-  doubles the upload size (original segments are still uploaded for archival),
-  and the reconciler has no `ffmpeg` dependency today.
-- **Client-side chaining** - JavaScript in the viewer page that plays segments
-  sequentially, hiding the boundary. Pros: no transcoding, segments are already
-  uploaded. Cons: the page needs JS (currently it is a static HTML page served
-  straight from S3 with no CSP control), and seek across segment boundaries is
-  non-trivial.
+**Rollout remaining.**
 
-**Recorded:** 2026-09-01.
+- Deploy the branch to the Mac mini.
+- Generate one representative historical clip with `--apply`.
+- Confirm the person entering is visible and tune the three-second pre-roll /
+  fifteen-second post-start window if needed.
+- Switch `CLIP_SOURCE=frigate_api` only after that proof.
+- Backfill dates while Frigate still retains their source recordings.
+- Keep legacy HTML for events whose source recordings have expired.
+
+**Updated:** 2026-09-14.
 
 
 ## 2. Mac mini and Frigate downtime / outage monitoring in Slack
